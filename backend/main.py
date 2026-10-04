@@ -180,6 +180,89 @@ def ota_update(request: OTARequest, background_tasks: BackgroundTasks, db: Sessi
 
 
 @app.get("/api/ota/status/{vehicle_id}")
+@app.get("/api/precheck/{vehicle_id}/{firmware_version}")
+def pre_update_check(
+    vehicle_id: str,
+    firmware_version: str,
+    db: Session = Depends(get_db)
+):
+    vehicle = db.query(Vehicle).filter(
+        Vehicle.vehicle_id == vehicle_id
+    ).first()
+
+    firmware = db.query(Firmware).filter(
+        Firmware.version == firmware_version
+    ).first()
+
+    if not vehicle:
+        return {
+            "allowed": False,
+            "reason": "Vehicle not found"
+        }
+
+    if not firmware:
+        return {
+            "allowed": False,
+            "reason": "Firmware not found"
+        }
+
+    # Simulated vehicle conditions
+    battery = 85
+    network = True
+    storage = 70
+    compatible = True
+
+    checks = {
+        "battery": battery >= 30,
+        "network": network,
+        "storage": storage >= 20,
+        "compatibility": compatible
+    }
+
+    allowed = all(checks.values())
+
+    return {
+        "vehicle_id": vehicle_id,
+        "firmware_version": firmware_version,
+        "battery": battery,
+        "network": network,
+        "storage": storage,
+        "compatibility": compatible,
+        "checks": checks,
+        "allowed": allowed
+    }
+@app.post("/api/ota/rollback/{vehicle_id}")
+def rollback_firmware(
+    vehicle_id: str,
+    db: Session = Depends(get_db)
+):
+    vehicle = db.query(Vehicle).filter(
+        Vehicle.vehicle_id == vehicle_id
+    ).first()
+
+    if not vehicle:
+        return {
+            "status": "Failed",
+            "message": "Vehicle not found"
+        }
+
+    previous_version = "v1.0.0"
+
+    vehicle.current_firmware = previous_version
+    db.commit()
+
+    log_event(
+        db,
+        f"Firmware rolled back to {previous_version}",
+        "Success"
+    )
+
+    return {
+        "status": "Success",
+        "vehicle_id": vehicle_id,
+        "current_firmware": previous_version,
+        "message": "Firmware rollback completed."
+    }
 def get_ota_status(vehicle_id: str, db: Session = Depends(get_db)):
     ota = db.query(OTAUpdate).filter(OTAUpdate.vehicle_id == vehicle_id).order_by(OTAUpdate.id.desc()).first()
     if not ota:
@@ -191,4 +274,30 @@ def get_ota_status(vehicle_id: str, db: Session = Depends(get_db)):
 def get_events(db: Session = Depends(get_db)):
     events = db.query(EventLog).order_by(EventLog.id.desc()).all()
     return [{"id": event.id, "event": event.event, "status": event.status, "timestamp": event.timestamp} for event in events]
+@app.get("/api/analytics")
+def get_analytics(db: Session = Depends(get_db)):
+    updates = db.query(OTAUpdate).all()
 
+    total = len(updates)
+    successful = sum(
+        1 for update in updates
+        if update.status == "Installed"
+    )
+    failed = sum(
+        1 for update in updates
+        if update.status in {"Failed", "Checksum Failed"}
+    )
+    in_progress = total - successful - failed
+
+    success_rate = (
+        (successful / total) * 100
+        if total > 0 else 0
+    )
+
+    return {
+        "total_updates": total,
+        "successful_updates": successful,
+        "failed_updates": failed,
+        "in_progress": in_progress,
+        "success_rate": round(success_rate, 2)
+    }
