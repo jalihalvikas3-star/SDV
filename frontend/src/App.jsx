@@ -3,6 +3,89 @@ import "./App.css";
 
 const CHECKSUM = "8f3a91c2e7b14d6a92fc01a9c92a";
 
+const API_BASE = "http://127.0.0.1:8000";
+const MAX_STATUS_POLLS = 60;
+
+/* Demo scenarios. `value` is sent to the backend as `failure_scenario`. */
+const SCENARIOS = [
+  { value: "none", label: "Normal OTA Update", hint: "Download, checksum verification, installation and success." },
+  { value: "network", label: "Network Failure", hint: "Connection is lost while the firmware downloads." },
+  { value: "low_battery", label: "Low Battery", hint: "Update is rejected at the preflight check." },
+  { value: "storage", label: "Storage Failure", hint: "Not enough storage space after the download." },
+  { value: "checksum", label: "Checksum Mismatch", hint: "Checksum verification deliberately fails." },
+  { value: "compatibility", label: "Compatibility Failure", hint: "Firmware is incompatible with the vehicle." },
+  { value: "installation", label: "Installation Failure", hint: "Installation fails after successful verification." },
+];
+
+/* Which step is shown as failed for each scenario (display only; the result comes from the backend). */
+const FAILURE_STAGE = {
+  network: "download",
+  storage: "download",
+  low_battery: "preflight",
+  compatibility: "preflight",
+  checksum: "verify",
+  installation: "install",
+};
+
+const FAILURE_HEADLINES = {
+  network: "Network failure",
+  low_battery: "Update rejected: low battery",
+  storage: "Insufficient storage",
+  checksum: "Verification failed",
+  compatibility: "Incompatible firmware",
+  installation: "Installation failed",
+};
+
+const FAILURE_TITLES = {
+  network: "Download aborted",
+  low_battery: "Update rejected",
+  storage: "Installation blocked",
+  checksum: "Installation blocked",
+  compatibility: "Update rejected",
+  installation: "Installation failed",
+};
+
+/* Survives leaving/returning to the OTA page, so two OTA runs can never overlap. */
+let otaRequestInFlight = false;
+
+/* Highest backend event id, or null if the event API is unreachable. */
+async function getLatestEventId() {
+  try {
+    const response = await fetch(`${API_BASE}/api/events`);
+    if (!response.ok) return null;
+    const events = await response.json();
+    return events.length ? Math.max(...events.map((event) => event.id)) : 0;
+  } catch (error) {
+    console.error("Could not read backend events:", error);
+    return null;
+  }
+}
+
+/*
+  The status API returns only "Failed". The backend writes the failure reason to the
+  event log just after committing the status, so retry briefly until it appears.
+*/
+async function fetchFailureReason(baselineEventId) {
+  if (baselineEventId === null) return "";
+
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    try {
+      const response = await fetch(`${API_BASE}/api/events`);
+      if (response.ok) {
+        const events = await response.json();
+        const failures = events
+          .filter((event) => event.id > baselineEventId && event.status === "Failed")
+          .sort((a, b) => a.id - b.id);
+        if (failures.length > 0) return failures[0].event;
+      }
+    } catch (error) {
+      console.error("Could not read backend events:", error);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  return "";
+}
+
 /* =========================
    ICONS
 ========================= */
@@ -229,7 +312,7 @@ function App() {
           />
         )}
 
-        {activePage === "Event Logs" && <EventLogs eventLogs={eventLogs} />}
+        {activePage === "Event Logs" && <EventLogs />}
 
         {activePage === "Vehicle" && (
           <Vehicle
@@ -479,73 +562,171 @@ function OTAUpdate({
   const [pushedVersion, setPushedVersion] = useState(availableVersion);
 
   const version = availableVersion || pushedVersion;
+  const [scenario, setScenario] = useState("none");
+  const [failedScenario, setFailedScenario] = useState("none");
+  const [failedStage, setFailedStage] = useState(null);
+  const [failureReason, setFailureReason] = useState("");
 
-  const startUpdate = () => {
+  const selectedScenario = SCENARIOS.find((item) => item.value === scenario) || SCENARIOS[0];
+
+  const failUpdate = (versionLabel, reason, stage, scenarioKey) => {
+    setFailedScenario(scenarioKey);
+    setFailedStage(stage);
+    setFailureReason(reason);
+    setStatus("failed");
+    setOtaHistory((previous) => [
+      {
+        id: Date.now(),
+        version: versionLabel,
+        result: "Failed",
+        reason,
+        time: new Date().toLocaleString(),
+      },
+      ...previous,
+    ]);
+    addEvent(reason, "Failed");
+    otaRequestInFlight = false;
+  };
+
+  const startUpdate = async () => {
+    if (otaRequestInFlight) {
+      addEvent("An OTA update is already in progress", "Info");
+      return;
+    }
+    otaRequestInFlight = true;
+
+    const scenarioToRun = scenario;
+    const scenarioLabel = (SCENARIOS.find((item) => item.value === scenarioToRun) || SCENARIOS[0]).label;
+    let firmware = null;
+    const versionLabel = () => (firmware && firmware.version) || availableVersion || pushedVersion || "-";
+
     setPushedVersion(availableVersion);
     setStatus("downloading");
     setProgress(0);
+    setFailedScenario(scenarioToRun);
+    setFailedStage(null);
+    setFailureReason("");
+    addEvent(
+      scenarioToRun === "none" ? "OTA update requested" : `OTA update requested (${scenarioLabel})`,
+      "Info"
+    );
 
-    addEvent("OTA update requested", "Success");
-    addEvent("Firmware download started", "Info");
+    try {
+      const firmwareResponse = await fetch(`${API_BASE}/api/firmware/latest`);
+      if (!firmwareResponse.ok) throw new Error("Failed to fetch firmware details");
+      firmware = await firmwareResponse.json();
+      if (!firmware.version) throw new Error(firmware.error || "No firmware available");
 
-    let currentProgress = 0;
+      // Remember the newest backend event so we can later find only this run's events.
+      const baselineEventId = await getLatestEventId();
 
-    const downloadTimer = setInterval(() => {
-      currentProgress += 10;
-      setProgress(currentProgress);
+      const response = await fetch(`${API_BASE}/api/ota/update`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          vehicle_id: "CAR-001",
+          firmware_version: firmware.version,
+          checksum: firmware.checksum,
+          failure_scenario: scenarioToRun,
+        }),
+      });
 
-      if (currentProgress >= 100) {
-        clearInterval(downloadTimer);
+      const result = await response.json();
+      if (!response.ok || result.status === "Failed") {
+        throw new Error(result.message || "OTA request failed");
+      }
 
-        addEvent("Firmware downloaded", "Success");
-        addEvent("Checksum verification started", "Info");
+      const statusMap = {
+        Downloading: "downloading",
+        Verifying: "verifying",
+        Installing: "installing",
+        Installed: "completed",
+        "Checksum Failed": "failed",
+        Failed: "failed",
+      };
 
-        setStatus("verifying");
+      let pollCount = 0;
+
+      const pollStatus = async () => {
+        pollCount += 1;
+        if (pollCount > MAX_STATUS_POLLS) {
+          failUpdate(versionLabel(), "OTA status polling timed out", null, scenarioToRun);
+          return;
+        }
+
+        const statusResponse = await fetch(`${API_BASE}/api/ota/status/CAR-001`);
+        if (!statusResponse.ok) throw new Error("Could not get OTA status");
+        const data = await statusResponse.json();
+        const nextStatus = statusMap[data.status];
+
+        if (!nextStatus) {
+          failUpdate(versionLabel(), `Unknown OTA status: ${data.status}`, null, scenarioToRun);
+          return;
+        }
+
+        if (nextStatus === "failed") {
+          // The status API only says "Failed"; the reason is in the backend event log.
+          const backendReason = await fetchFailureReason(baselineEventId);
+          failUpdate(
+            versionLabel(),
+            backendReason || "OTA update failed. See the Event Logs page for details.",
+            data.status === "Checksum Failed" ? "verify" : FAILURE_STAGE[scenarioToRun] || null,
+            scenarioToRun
+          );
+          return;
+        }
+
+        setStatus(nextStatus);
+
+        if (data.status === "Downloading") {
+          setProgress((previous) => Math.min(previous + 10, 25));
+        } else if (data.status === "Verifying") {
+          setProgress(40);
+        } else if (data.status === "Installing") {
+          setProgress((previous) => Math.min(Math.max(previous, 50) + 10, 95));
+        } else if (data.status === "Installed") {
+          setProgress(100);
+          setFirmwareVersion(firmware.version);
+          setAvailableVersion("");
+          setOtaHistory((previous) => [
+            {
+              id: Date.now(),
+              version: firmware.version,
+              result: "Success",
+              time: new Date().toLocaleString(),
+            },
+            ...previous,
+          ]);
+          addEvent(`Firmware ${firmware.version} installed successfully`, "Success");
+          otaRequestInFlight = false;
+          return;
+        }
 
         setTimeout(() => {
-          setStatus("verified");
+          pollStatus().catch((error) => {
+            failUpdate(versionLabel(), error.message, null, scenarioToRun);
+          });
+        }, 1000);
+      };
 
-          addEvent("SHA-256 checksum verified", "Success");
-
-          setTimeout(() => {
-            setStatus("installing");
-            setProgress(0);
-
-            addEvent("Firmware installation started", "Info");
-
-            let installProgress = 0;
-
-            const installTimer = setInterval(() => {
-              installProgress += 20;
-              setProgress(installProgress);
-
-              if (installProgress >= 100) {
-                clearInterval(installTimer);
-
-                setStatus("completed");
-                setOtaHistory((previous) => [
-                  {
-                    id: Date.now(),
-                    version: availableVersion || pushedVersion || firmwareVersion,
-                    result: "Success",
-                    time: new Date().toLocaleString(),
-                  },
-                  ...previous,
-                ]);
-                setFirmwareVersion(availableVersion);
-                setAvailableVersion("");
-
-                addEvent("Firmware installation completed", "Success");
-                addEvent(`Vehicle firmware updated to ${availableVersion}`, "Success");
-              }
-            }, 500);
-          }, 1200);
-        }, 1800);
-      }
-    }, 300);
+      pollStatus().catch((error) => {
+        failUpdate(versionLabel(), error.message, null, scenarioToRun);
+      });
+    } catch (error) {
+      failUpdate(versionLabel(), error.message, null, scenarioToRun);
+    }
   };
 
   const simulateChecksumFailure = () => {
+    if (otaRequestInFlight) {
+      addEvent("An OTA update is already in progress", "Info");
+      return;
+    }
+    otaRequestInFlight = true;
+    setFailedScenario("checksum");
+    setFailedStage("verify");
+    setFailureReason("");
+
     setPushedVersion(availableVersion);
     setStatus("downloading");
     setProgress(0);
@@ -582,6 +763,7 @@ function OTAUpdate({
 
           addEvent("SHA-256 checksum mismatch", "Failed");
           addEvent("Firmware installation blocked", "Failed");
+          otaRequestInFlight = false;
         }, 1500);
       }
     }, 300);
@@ -590,6 +772,8 @@ function OTAUpdate({
   const resetUpdate = () => {
     setStatus("ready");
     setProgress(0);
+    setFailedStage(null);
+    setFailureReason("");
   };
 
   /* ring + step state derived from status */
@@ -611,13 +795,23 @@ function OTAUpdate({
       ? "active"
       : status === "ready"
       ? "pending"
+      : status === "failed"
+      ? failedStage === "download"
+        ? "failed"
+        : ["verify", "install"].includes(failedStage)
+        ? "done"
+        : "blocked"
       : "done";
 
   const verifyState =
     status === "verifying"
       ? "active"
       : status === "failed"
-      ? "failed"
+      ? failedStage === "verify"
+        ? "failed"
+        : failedStage === "install"
+        ? "done"
+        : "blocked"
       : ["verified", "installing", "completed"].includes(status)
       ? "done"
       : "pending";
@@ -628,7 +822,9 @@ function OTAUpdate({
       : status === "completed"
       ? "done"
       : status === "failed"
-      ? "blocked"
+      ? failedStage === "install"
+        ? "failed"
+        : "blocked"
       : "pending";
 
   const steps = [
@@ -644,7 +840,9 @@ function OTAUpdate({
     verified: "Checksum verified",
     installing: "Installing firmware",
     completed: "Update completed",
-    failed: "Verification failed",
+    failed:
+      FAILURE_HEADLINES[failedScenario] ||
+      (failedStage === "verify" ? "Verification failed" : "Update failed"),
   }[status];
 
   const detail = {
@@ -656,7 +854,11 @@ function OTAUpdate({
     verified: "SHA-256 checksum matches. Firmware is valid.",
     installing: "Updating vehicle firmware. Do not disconnect.",
     completed: `CAR-001 is now running firmware ${firmwareVersion}.`,
-    failed: "The received firmware does not match the expected SHA-256 checksum.",
+    failed:
+      failureReason ||
+      (failedStage === "verify"
+        ? "The received firmware does not match the expected SHA-256 checksum."
+        : "The OTA update failed."),
   }[status];
 
   const badge =
@@ -713,7 +915,7 @@ function OTAUpdate({
 
             {status === "failed" && (
               <div className="failure-message">
-                <strong>Installation blocked</strong>
+                <strong>{FAILURE_TITLES[failedScenario] || "Installation blocked"}</strong>
                 <span>Vehicle stays on firmware {firmwareVersion}</span>
               </div>
             )}
@@ -743,6 +945,39 @@ function OTAUpdate({
                 SHA-256 checksum
               </p>
               <code>{CHECKSUM}</code>
+            </div>
+
+            <div className="checksum-box">
+              <p>
+                <Icon name="update" size={14} />
+                Demo scenario
+              </p>
+              <select
+                id="demo-scenario"
+                aria-label="Demo scenario"
+                value={scenario}
+                onChange={(event) => setScenario(event.target.value)}
+                disabled={status !== "ready" || !availableVersion}
+                style={{
+                  width: "100%",
+                  marginTop: "8px",
+                  padding: "10px 12px",
+                  borderRadius: "10px",
+                  border: "1px solid rgba(255, 255, 255, 0.18)",
+                  background: "#111827",
+                  color: "#f3f4f6",
+                  fontSize: "0.95rem",
+                  cursor: status === "ready" && availableVersion ? "pointer" : "not-allowed",
+                  opacity: status === "ready" && availableVersion ? 1 : 0.6,
+                }}
+              >
+                {SCENARIOS.map((item) => (
+                  <option key={item.value} value={item.value} style={{ background: "#111827", color: "#f3f4f6" }}>
+                    {item.label}
+                  </option>
+                ))}
+              </select>
+              <small style={{ display: "block", marginTop: "6px" }}>{selectedScenario.hint}</small>
             </div>
 
             <ol className="steps">
@@ -818,7 +1053,7 @@ function OTAUpdate({
               <div className="log-row" key={record.id}>
                 <span>{record.time}</span>
                 <strong>{record.version}</strong>
-                <span className={`chip ${record.result.toLowerCase()}`}>{record.result}</span>
+                <span className={`chip ${record.result.toLowerCase()}`} title={record.reason || ""}>{record.result}</span>
               </div>
             ))}
           </div>
@@ -834,8 +1069,33 @@ function OTAUpdate({
 
 const FILTERS = ["All", "Success", "Info", "Failed"];
 
-function EventLogs({ eventLogs }) {
+function EventLogs() {
   const [filter, setFilter] = useState("All");
+  const [eventLogs, setEventLogs] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    const fetchEvents = async () => {
+      try {
+        const response = await fetch("http://127.0.0.1:8000/api/events");
+
+        if (!response.ok) {
+          throw new Error("Could not load backend events");
+        }
+
+        const data = await response.json();
+        setEventLogs(data);
+        setError("");
+      } catch (err) {
+        setError(err.message);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    fetchEvents();
+  }, []);
 
   const visibleLogs =
     filter === "All" ? eventLogs : eventLogs.filter((log) => log.status === filter);
@@ -871,12 +1131,27 @@ function EventLogs({ eventLogs }) {
             <span>Status</span>
           </div>
 
-          {visibleLogs.length === 0 && (
+          {loading && <div className="log-empty">Loading events...</div>}
+
+          {!loading && error && (
+            <div className="log-empty">
+              {error}. Make sure the backend is running.
+            </div>
+          )}
+
+          {!loading && !error && visibleLogs.length === 0 && (
             <div className="log-empty">No {filter.toLowerCase()} events yet.</div>
           )}
 
-          {visibleLogs.map((log, index) => (
-            <LogRow key={index} time={log.time} event={log.event} status={log.status} />
+          {!loading && !error && visibleLogs.map((log) => (
+            <LogRow
+  key={log.id}
+  time={new Date(log.timestamp + "Z").toLocaleString("en-IN", {
+    timeZone: "Asia/Kolkata",
+  })}
+  event={log.event}
+  status={log.status}
+/>
           ))}
         </div>
       </div>
