@@ -1,22 +1,18 @@
 from database import SessionLocal
-from models import Vehicle, Firmware
+from models import Firmware
+from firmware_data import get_firmware_checksum
 
 db = SessionLocal()
 
-vehicle = Vehicle(
-    vehicle_id="CAR-001",
-    current_firmware="v1.0.0",
-)
+firmware = db.query(Firmware).filter(
+    Firmware.version == "v1.1.0"
+).first()
 
-firmware = Firmware(
-    version="v1.1.0",
-    checksum="demo-checksum-123",
-)
+if firmware:
+    firmware.checksum = get_firmware_checksum()
+    db.commit()
+    print("Firmware checksum updated successfully.")
+else:
+    print("Firmware not found.")
 
-db.add(vehicle)
-db.add(firmware)
-
-db.commit()
 db.close()
-
-print("Initial vehicle and firmware data added successfully.")
